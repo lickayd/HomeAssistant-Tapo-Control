@@ -830,6 +830,13 @@ class TapoDirectCamEntity(TapoCamEntity):
 
         async def _cleanup():
             pump_task.cancel()
+            # Wait for the pump to actually stop before closing stdin —
+            # otherwise it writes to the closed pipe and asyncio logs an error.
+            try:
+                await asyncio.wait_for(asyncio.shield(pump_task), timeout=2)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                pass
+            # Stop recorder ffmpeg
             try:
                 record_proc.stdin.close()
             except Exception:
@@ -842,15 +849,20 @@ class TapoDirectCamEntity(TapoCamEntity):
                 await asyncio.wait_for(record_proc.wait(), timeout=10)
             except asyncio.TimeoutError:
                 record_proc.kill()
-            try:
-                await asyncio.wait_for(streamer.stop(), timeout=10)
-            except asyncio.TimeoutError:
-                LOGGER.warning("async_tapo_record: streamer.stop() timed out")
-                try:
-                    streamer.streamProcess.terminate()
-                except Exception:
-                    pass
+            # Tear down the Streamer directly — streamer.stop() hangs because
+            # the pytapo media session doesn't cancel cleanly via await.
+            streamer.running = False
             info["streamProcess"].cancel()
+            try:
+                streamer.streamProcess.terminate()
+                await asyncio.wait_for(streamer.streamProcess.wait(), timeout=5)
+            except asyncio.TimeoutError:
+                try:
+                    streamer.streamProcess.kill()
+                except ProcessLookupError:
+                    pass
+            except ProcessLookupError:
+                pass
 
         # Control duration by wall clock — stream timestamps are large monotonic
         # values so ffmpeg's -t output option stops immediately.
