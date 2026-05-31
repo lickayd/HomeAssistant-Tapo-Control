@@ -89,6 +89,12 @@ UPDATE_CHECK_PERIOD = 86400
 COLD_DIR_DELETE_TIME = 24 * 60 * 60
 HOT_DIR_DELETE_TIME = 60 * 60
 
+SERVICE_RECORD = "record"
+SCHEMA_SERVICE_RECORD = {
+    vol.Required("filename"): cv.string,
+    vol.Optional("duration", default=30): vol.Coerce(int),
+}
+
 SERVICE_SAVE_PRESET = "save_preset"
 SCHEMA_SERVICE_SAVE_PRESET = {
     vol.Required(NAME): cv.string,

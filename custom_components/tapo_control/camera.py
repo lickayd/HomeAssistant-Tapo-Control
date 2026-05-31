@@ -25,6 +25,8 @@ from homeassistant.components.stream import (
 from .const import (
     CONF_RTSP_TRANSPORT,
     ENABLE_STREAM,
+    SERVICE_RECORD,
+    SCHEMA_SERVICE_RECORD,
     SERVICE_SAVE_PRESET,
     SCHEMA_SERVICE_SAVE_PRESET,
     SERVICE_DELETE_PRESET,
@@ -51,6 +53,11 @@ async def async_setup_entry(
     entry: dict = hass.data[DOMAIN][config_entry.entry_id]
 
     platform = entity_platform.current_platform.get()
+    platform.async_register_entity_service(
+        SERVICE_RECORD,
+        SCHEMA_SERVICE_RECORD,
+        "async_tapo_record",
+    )
     platform.async_register_entity_service(
         SERVICE_SAVE_PRESET,
         SCHEMA_SERVICE_SAVE_PRESET,
@@ -434,6 +441,39 @@ class TapoCamEntity(Camera):
             else:
                 LOGGER.error("Preset " + preset + " does not exist.")
 
+    async def async_tapo_record(self, filename: str, duration: int = 30) -> None:
+        """Record camera stream directly via ffmpeg from the RTSP source.
+
+        This bypasses HA's Stream infrastructure (camera.record) which hangs
+        indefinitely when the stream source is a pipe (TapoDirectCamEntity).
+        """
+        rtsp_url = getStreamSource(self._config_entry, self._stream_id)
+        LOGGER.debug(
+            "async_tapo_record: recording %ss from %s to %s", duration, rtsp_url, filename
+        )
+        os.makedirs(os.path.dirname(filename), exist_ok=True)
+        cmd = [
+            self._ffmpeg.binary,
+            "-y",
+            "-rtsp_transport", "tcp",
+            "-i", rtsp_url,
+            "-t", str(duration),
+            "-c", "copy",
+            filename,
+        ]
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            LOGGER.error(
+                "async_tapo_record: ffmpeg failed (code %s): %s",
+                proc.returncode,
+                stderr.decode(errors="replace").strip(),
+            )
+
 
 class TapoRTSPCamEntity(TapoCamEntity):
     def __init__(
@@ -527,18 +567,19 @@ class TapoDirectCamEntity(TapoCamEntity):
         self._streamer: Streamer | None = None
         self._stream_fd: int | None = None
         self._stream_task: asyncio.Task | None = None
+        self._idle_teardown_task: asyncio.Task | None = None
         self._enabled_by_default = enabledByDefault
         self.videoStream = videoStream
+        self._is_battery_camera: bool = entry.get("isRunningOnBattery", False)
 
     @property
     def entity_registry_enabled_default(self) -> bool:
         return self._enabled_by_default
 
     async def async_will_remove_from_hass(self) -> None:
-        if self._streamer:
-            await self._streamer.stop()
-        if self._stream_task:
-            self._stream_task.cancel()
+        if self._idle_teardown_task:
+            self._idle_teardown_task.cancel()
+        await self._teardown_pipe()
         await super().async_will_remove_from_hass()
 
     async def async_camera_image(
@@ -656,9 +697,44 @@ class TapoDirectCamEntity(TapoCamEntity):
             self._stream_task,
         )
 
+        if self._is_battery_camera:
+            self._schedule_idle_teardown()
+
+    def _schedule_idle_teardown(self, delay: int = 30) -> None:
+        """Reset the idle timer that stops the streamer after inactivity."""
+        if self._idle_teardown_task and not self._idle_teardown_task.done():
+            self._idle_teardown_task.cancel()
+        self._idle_teardown_task = asyncio.create_task(self._idle_teardown(delay))
+
+    async def _idle_teardown(self, delay: int) -> None:
+        """Tear down the streamer after `delay` seconds if HA has no active stream."""
+        await asyncio.sleep(delay)
+        if self._HAstream is None or not self._HAstream.available:
+            LOGGER.debug(
+                "%s: idle timeout — tearing down battery cam pipe", self.entity_id
+            )
+            await self._teardown_pipe()
+
+    async def _teardown_pipe(self) -> None:
+        """Stop the underlying Streamer and reset pipe state."""
+        LOGGER.debug("%s: _teardown_pipe called", self.entity_id)
+        if self._streamer:
+            try:
+                await self._streamer.stop()
+            except Exception as err:
+                LOGGER.warning("_teardown_pipe: error stopping streamer: %s", err)
+            self._streamer = None
+        if self._stream_task:
+            self._stream_task.cancel()
+            self._stream_task = None
+        self._stream_fd = None
+
     async def stream_source(self) -> str | None:
+        await self._ensure_av_pipe()
+        if self._stream_fd is None:
+            return None
         source = f"pipe:{self._stream_fd}"
-        LOGGER.debug("stream_source: returning  %s", source)
+        LOGGER.debug("stream_source: returning %s", source)
         return source
 
     async def async_create_stream(self) -> Stream | None:
@@ -670,5 +746,115 @@ class TapoDirectCamEntity(TapoCamEntity):
 
     def _on_stream_state(self):
         if not self._HAstream.available:
-            LOGGER.debug("%s: HA stream unavailable: restarting", self.entity_id)
-            asyncio.create_task(self._ensure_av_pipe(newStream=True))
+            if self._is_battery_camera:
+                # Camera likely went to sleep — release the streamer so it can
+                # stay asleep. stream_source() will lazily restart on next demand.
+                LOGGER.debug(
+                    "%s: battery cam stream dropped, releasing streamer",
+                    self.entity_id,
+                )
+                asyncio.create_task(self._teardown_pipe())
+            else:
+                LOGGER.debug("%s: HA stream unavailable: restarting", self.entity_id)
+                asyncio.create_task(self._ensure_av_pipe(newStream=True))
+
+    async def async_tapo_record(self, filename: str, duration: int = 30) -> None:
+        """Record using a dedicated Streamer instance, bypassing HA's Stream.
+
+        Data flows: Tapo camera → Streamer ffmpeg (mpegts on stdout)
+                    → asyncio pump → recorder ffmpeg stdin → mp4 file.
+        """
+        LOGGER.debug(
+            "async_tapo_record (direct): recording %ss to %s", duration, filename
+        )
+        os.makedirs(os.path.dirname(filename), exist_ok=True)
+
+        streamer = Streamer(
+            self._controller,
+            includeAudio=False,
+            quality=self._directQuality,
+            logFunction=self.logFunction,
+        )
+        info = await streamer.start()
+
+        # Wait for the first chunk before starting the recorder — the camera
+        # connection has startup latency and ffmpeg will give up immediately
+        # if the pipe is empty when it tries to probe the input.
+        try:
+            first_chunk = await asyncio.wait_for(
+                streamer.streamProcess.stdout.read(65536), timeout=15
+            )
+        except asyncio.TimeoutError:
+            LOGGER.error("async_tapo_record: no data from Streamer within 15s")
+            await streamer.stop()
+            info["streamProcess"].cancel()
+            return
+
+        if not first_chunk:
+            LOGGER.error("async_tapo_record: Streamer produced no data")
+            await streamer.stop()
+            info["streamProcess"].cancel()
+            return
+
+        cmd = [
+            self._ffmpeg.binary,
+            "-y",
+            "-f", "mpegts",
+            "-i", "pipe:0",
+            "-c", "copy",
+            "-f", "mp4",
+            "-movflags", "frag_keyframe+empty_moov",
+            filename,
+        ]
+        record_proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        record_proc.stdin.write(first_chunk)
+
+        async def _pump():
+            """Forward mpegts chunks from Streamer stdout to recorder stdin."""
+            try:
+                while True:
+                    chunk = await streamer.streamProcess.stdout.read(65536)
+                    if not chunk:
+                        break
+                    record_proc.stdin.write(chunk)
+                    await record_proc.stdin.drain()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
+        pump_task = asyncio.create_task(_pump())
+
+        async def _cleanup():
+            pump_task.cancel()
+            try:
+                record_proc.stdin.close()
+            except Exception:
+                pass
+            try:
+                record_proc.terminate()
+            except ProcessLookupError:
+                pass
+            try:
+                await asyncio.wait_for(record_proc.wait(), timeout=10)
+            except asyncio.TimeoutError:
+                record_proc.kill()
+            try:
+                await asyncio.wait_for(streamer.stop(), timeout=10)
+            except asyncio.TimeoutError:
+                LOGGER.warning("async_tapo_record: streamer.stop() timed out")
+                try:
+                    streamer.streamProcess.terminate()
+                except Exception:
+                    pass
+            info["streamProcess"].cancel()
+
+        # Control duration by wall clock — stream timestamps are large monotonic
+        # values so ffmpeg's -t output option stops immediately.
+        await asyncio.sleep(duration)
+
+        # Fire cleanup in background so the automation action returns immediately.
+        asyncio.create_task(_cleanup())

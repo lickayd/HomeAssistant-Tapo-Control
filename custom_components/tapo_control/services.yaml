@@ -1,3 +1,28 @@
+record:
+  name: Record
+  description: Records the camera stream directly via ffmpeg. Use this instead of camera.record to avoid hangs with direct-stream cameras.
+  target:
+    entity:
+      domain: camera
+      integration: tapo_control
+  fields:
+    filename:
+      description: "Full path to the output file (e.g. /media/tapo/thumbs/clip.mp4)"
+      example: "/media/tapo/thumbs/clip.mp4"
+      required: true
+      name: Filename
+      selector:
+        text:
+    duration:
+      description: "Recording duration in seconds (default: 30)"
+      example: "30"
+      required: false
+      name: Duration
+      selector:
+        number:
+          min: 1
+          max: 3600
+          unit_of_measurement: seconds
 save_preset:
   name: Save preset
   description: Saves the current PTZ position to a preset
